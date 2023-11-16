@@ -26,7 +26,7 @@
  * the header and status consume too entries
  */
 #define DISK_SEG_MAX			(VIRTIO_BLK_QUEUE_SIZE - 2)
-#define VIRTIO_BLK_QUEUE_SIZE		256
+#define VIRTIO_BLK_QUEUE_SIZE		128
 #define NUM_VIRT_QUEUES			1
 
 struct blk_dev_req {
@@ -72,12 +72,34 @@ void virtio_blk_complete(void *param, long len)
 	*status	= (len < 0) ? VIRTIO_BLK_S_IOERR : VIRTIO_BLK_S_OK;
 
 	mutex_lock(&bdev->mutex);
-	virt_queue__set_used_elem(req->vq, req->head, len);
+	if (req->vq->is_packed)
+		virt_queue_packed__set_used_elem(req->vq, req->head, len, req->in + req->out);
+	else
+		virt_queue__set_used_elem(req->vq, req->head, len);
 	mutex_unlock(&bdev->mutex);
 
 	if (virtio_queue__should_signal(&bdev->vqs[queueid]))
 		bdev->vdev.ops->signal_vq(req->kvm, &bdev->vdev, queueid);
 }
+
+#if 0
+static void dump_req(struct blk_dev_req* req) {
+        printf("======= req->out: %d req->in: %d req->head: %d\n", req->out, req->in, req->head);
+        for (int i = 0; i < req->out; i++) {
+                printf("OUT req->iov[%d].iov_base: %p "
+                       "req->iov[%d].iov_len: %ld\n",
+                       i, req->iov[i].iov_base, i,
+                       req->iov[i].iov_len);
+        }
+        for (int i = 0; i < req->in; i++) {
+                printf("IN req->iov[%d].iov_base: %p "
+                       "req->iov[%d].iov_len: %ld\n",
+                       i, req->iov[i + req->out].iov_base,
+                       i, req->iov[i + req->out].iov_len);
+        }
+		printf("=======\n");
+}
+#endif
 
 static void virtio_blk_do_io_request(struct kvm *kvm, struct virt_queue *vq, struct blk_dev_req *req)
 {
@@ -139,19 +161,49 @@ static void virtio_blk_do_io_request(struct kvm *kvm, struct virt_queue *vq, str
 	}
 }
 
+static inline void virt_queue_packed__pop(struct virt_queue *queue, int sgs)
+{
+	u16 head = queue->last_avail_idx;
+	// Check if the desc is indirect
+	struct vring_packed_desc *desc = &queue->packed_vring.desc[head];
+
+	if (desc->flags & VRING_DESC_F_INDIRECT) {
+		sgs = 1;
+	}
+
+	queue->last_avail_idx = (queue->last_avail_idx + sgs) & (queue->packed_vring.num - 1);
+
+	/* Check the overflow of last_avail_idx */
+	if (queue->last_avail_idx < head)
+		queue->packed_vring.avail_phase = !queue->packed_vring.avail_phase;
+}
+
 static void virtio_blk_do_io(struct kvm *kvm, struct virt_queue *vq, struct blk_dev *bdev)
 {
 	struct blk_dev_req *req;
 	u16 head;
 
-	while (virt_queue__available(vq)) {
-		head		= virt_queue__pop(vq);
-		req		= &bdev->reqs[head];
-		req->head	= virt_queue__get_head_iov(vq, req->iov, &req->out,
+	if (vq->is_packed) {
+		while (virt_queue_packed__available(vq)) {
+			head		= vq->last_avail_idx;
+			req		= &bdev->reqs[head];
+			req->head	= virt_queue_packed__get_head_iov(vq, req->iov, &req->out,
 					&req->in, head, kvm);
-		req->vq		= vq;
+			req->vq		= vq;
+			virt_queue_packed__pop(vq, req->out + req->in);
 
-		virtio_blk_do_io_request(kvm, vq, req);
+			virtio_blk_do_io_request(kvm, vq, req);
+		}
+	} else {
+		while (virt_queue__available(vq)) {
+			head		= virt_queue__pop(vq);
+			req		= &bdev->reqs[head];
+			req->head	= virt_queue__get_head_iov(vq, req->iov, &req->out,
+					&req->in, head, kvm);
+			req->vq		= vq;
+
+			virtio_blk_do_io_request(kvm, vq, req);
+		}
 	}
 }
 
@@ -176,9 +228,10 @@ static u64 get_host_features(struct kvm *kvm, void *dev)
 	return	1UL << VIRTIO_BLK_F_SEG_MAX
 		| 1UL << VIRTIO_BLK_F_FLUSH
 		| 1UL << VIRTIO_RING_F_EVENT_IDX
-		| 1UL << VIRTIO_RING_F_INDIRECT_DESC
 		| 1UL << VIRTIO_F_ANY_LAYOUT
+		| 1UL << VIRTIO_F_RING_PACKED
 		| (bdev->disk->readonly ? 1UL << VIRTIO_BLK_F_RO : 0);
+	//| 1UL << VIRTIO_RING_F_INDIRECT_DESC
 }
 
 static void notify_status(struct kvm *kvm, void *dev, u32 status)

@@ -97,6 +97,80 @@ static inline bool virt_desc__test_flag(struct virt_queue *vq,
 	return !!(virtio_guest_to_host_u16(vq->endian, desc->flags) & flag);
 }
 
+static inline bool virt_desc_packed__test_flag(struct virt_queue *vq,
+					struct vring_packed_desc *desc, u16 flag)
+{
+	return !!(virtio_guest_to_host_u16(vq->endian, desc->flags) & flag);
+}
+
+static void flags_to_str(u16 flags, char *str)
+{
+	if (flags & VRING_DESC_F_NEXT)
+		strcat(str, "N");
+	if (flags & VRING_DESC_F_WRITE)
+		strcat(str, "W");
+	if (flags & VRING_DESC_F_INDIRECT)
+		strcat(str, "I");
+	if (flags & VRING_DESC_F_AVAIL)
+		strcat(str, "A");
+	if (flags & VRING_DESC_F_USED)
+		strcat(str, "U");
+}
+
+void dump_virtqueue_all_desc(struct virt_queue *queue)
+{
+	unsigned int i;
+	struct vring_packed_desc *desc;
+
+	/* format to markdown table*/
+	printf("====== vring.num: %d avail_phase: %d used_phase: %d last_avail_idx: %d last_used_idx: %d\n", queue->packed_vring.num, queue->packed_vring.avail_phase, queue->packed_vring.used_phase, queue->last_avail_idx, queue->packed_vring.last_used_idx);
+	printf("| %10s | %10s | %10s | %10s | %20s |\n", "idx", "addr", "len", "id", "flags");
+	printf("| %10s | %10s | %10s | %10s | %20s |\n", "----------", "----------", "----------", "----------", "----------");
+	for (i = 0; i < queue->packed_vring.num; i++) {
+		char flags[20] = {0};
+		desc = &queue->packed_vring.desc[i];
+		flags_to_str(desc->flags, flags);
+		printf("| %10d | %10llx | %10d | %10d | %20s |\n", i, desc->addr, desc->len, desc->id, flags);
+	}
+	printf("======\n");
+}
+
+void virt_queue_packed__set_used_elem(struct virt_queue *queue, u32 head, u32 len, u32 sgs)
+{
+	struct vring_packed_desc *desc;
+	struct packed_vring *packed_vring = &queue->packed_vring;
+
+	desc = &packed_vring->desc[packed_vring->last_used_idx];
+	
+	desc->addr = 0;
+	desc->len = len;
+
+	if (len != 0) {
+		desc->flags |= VRING_DESC_F_WRITE;
+	}
+	desc->id = head;
+
+	wmb();
+
+	if (packed_vring->used_phase) {
+		desc->flags |= VRING_DESC_F_USED;
+	} else {
+		desc->flags &= ~VRING_DESC_F_USED;
+	}
+
+	/* if the desc is indirect, last_used_idx +1, otherwises, add the sgs */
+	if (virt_desc_packed__test_flag(queue, desc, VRING_DESC_F_INDIRECT)) {
+		packed_vring->last_used_idx += 1;
+	} else {
+		packed_vring->last_used_idx += sgs;
+	}
+
+	if (packed_vring->last_used_idx >= packed_vring->num) {
+		packed_vring->last_used_idx -= packed_vring->num;
+		packed_vring->used_phase = !packed_vring->used_phase;
+	}
+}
+
 /*
  * Each buffer in the virtqueues is actually a chain of descriptors.  This
  * function returns the next descriptor in the chain, or max if we're at the
@@ -112,6 +186,22 @@ static unsigned next_desc(struct virt_queue *vq, struct vring_desc *desc,
 		return max;
 
 	next = virtio_guest_to_host_u16(vq->endian, desc[i].next);
+
+	/* Ensure they're not leading us off end of descriptors. */
+	return min(next, max);
+}
+
+static unsigned next_packed_desc(struct virt_queue *vq, struct vring_packed_desc *desc,
+			  unsigned int i, unsigned int max)
+{
+	unsigned int next;
+
+	/* If this descriptor says it doesn't chain, we're done. */
+	if (!virt_desc_packed__test_flag(vq, &desc[i], VRING_DESC_F_NEXT))
+		return max;
+
+	next = virtio_guest_to_host_u16(vq->endian, ++i);
+	next = next & (vq->packed_vring.num - 1);
 
 	/* Ensure they're not leading us off end of descriptors. */
 	return min(next, max);
@@ -147,6 +237,58 @@ u16 virt_queue__get_head_iov(struct virt_queue *vq, struct iovec iov[], u16 *out
 	} while ((idx = next_desc(vq, desc, idx, max)) != max);
 
 	return head;
+}
+
+u16 virt_queue_packed__get_head_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, u16 head, struct kvm *kvm)
+{
+	struct vring_packed_desc *desc;
+	u16 idx;
+	u16 max;
+	bool indirect = false;
+	int buffer_id = 0;
+
+	idx = head;
+	*out = *in = 0;
+	max = vq->packed_vring.num;
+	desc = vq->packed_vring.desc;
+
+	if (virt_desc_packed__test_flag(vq, &desc[idx], VRING_DESC_F_INDIRECT)) {
+		buffer_id = virtio_guest_to_host_u16(vq->endian, desc[idx].id);
+
+		max = virtio_guest_to_host_u32(vq->endian, desc[idx].len) / sizeof(struct vring_desc);
+		desc = guest_flat_to_host(kvm, virtio_guest_to_host_u64(vq->endian, desc[idx].addr));
+		idx = 0;
+		indirect = true;
+	}
+
+	do {
+		/* Grab the first descriptor, and check it's OK. */
+		iov[*out + *in].iov_len = virtio_guest_to_host_u32(vq->endian, desc[idx].len);
+		iov[*out + *in].iov_base = guest_flat_to_host(kvm,
+							      virtio_guest_to_host_u64(vq->endian, desc[idx].addr));
+		/* If this is an input descriptor, increment that count. */
+		if (virt_desc_packed__test_flag(vq, &desc[idx], VRING_DESC_F_WRITE))
+			(*in)++;
+		else
+			(*out)++;
+		/*
+		The first descriptor is located at the start of the indirect
+		descriptor table, additional indirect descriptors come
+		immediately afterwards. The VIRTQ_DESC_F_WRITE flags bit is the
+		only valid flag for descriptors in the indirect table. Others
+		are reserved and are ignored by the device. Buffer ID is also
+		reserved and is ignored by the device.
+		*/
+		if (indirect) {
+			idx++;
+		} else {
+			buffer_id = virtio_guest_to_host_u16(vq->endian, desc[idx].id);
+			idx = next_packed_desc(vq, desc, idx, max);
+		}
+	} while (idx != max);
+
+	// the valid id is saved at the last descriptor
+	return buffer_id;
 }
 
 u16 virt_queue__get_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, struct kvm *kvm)
@@ -207,15 +349,28 @@ void virtio_init_device_vq(struct kvm *kvm, struct virtio_device *vdev,
 		vring_init(&vq->vring, nr_descs, p, addr->align);
 	} else {
 		u64 desc = (u64)addr->desc_hi << 32 | addr->desc_lo;
-		u64 avail = (u64)addr->avail_hi << 32 | addr->avail_lo;
-		u64 used = (u64)addr->used_hi << 32 | addr->used_lo;
 
-		vq->vring = (struct vring) {
-			.desc	= guest_flat_to_host(kvm, desc),
-			.used	= guest_flat_to_host(kvm, used),
-			.avail	= guest_flat_to_host(kvm, avail),
-			.num	= nr_descs,
-		};
+		vq->is_packed= !!(vdev->features & (1UL << VIRTIO_F_RING_PACKED));
+
+		if (!vq->is_packed) {
+			u64 avail = (u64)addr->avail_hi << 32 | addr->avail_lo;
+			u64 used = (u64)addr->used_hi << 32 | addr->used_lo;
+
+			vq->vring = (struct vring) {
+				.desc	= guest_flat_to_host(kvm, desc),
+				.used	= guest_flat_to_host(kvm, used),
+				.avail	= guest_flat_to_host(kvm, avail),
+				.num	= nr_descs,
+			};
+		} else {
+			vq->packed_vring = (struct packed_vring) {
+				.desc	= guest_flat_to_host(kvm, desc),
+				.num	= nr_descs,
+				.avail_phase = true,
+				.used_phase = true,
+				.last_used_idx = 0,
+			};
+		}
 	}
 }
 
@@ -247,6 +402,10 @@ bool virtio_queue__should_signal(struct virt_queue *vq)
 {
 	u16 old_idx, new_idx, event_idx;
 
+	// TODO
+	if (vq->is_packed) {
+		return true;
+	}
 	/*
 	 * Use mb to assure used idx has been increased before we signal the
 	 * guest, and we don't read a stale value for used_event. Without a mb

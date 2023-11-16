@@ -67,8 +67,20 @@ struct vring_addr {
 	};
 };
 
+struct packed_vring {
+	u16     last_used_idx;
+	u16 num;
+	bool avail_phase;
+	bool used_phase;
+
+	struct vring_packed_desc* desc;
+};
+
 struct virt_queue {
-	struct vring	vring;
+	union {
+		struct vring	vring;
+		struct packed_vring packed_vring;
+	};
 	struct vring_addr vring_addr;
 	/* The last_avail_idx field is an index to ->ring of struct vring_avail.
 	   It's where we assume the next request index is at.  */
@@ -77,6 +89,7 @@ struct virt_queue {
 	u16		endian;
 	bool		use_event_idx;
 	bool		enabled;
+	bool is_packed;
 	struct virtio_device *vdev;
 
 	/* vhost IRQ handling */
@@ -195,9 +208,19 @@ static inline bool virt_queue__available(struct virt_queue *vq)
 	return vq->vring.avail->idx != last_avail_idx;
 }
 
+#define VRING_DESC_F_AVAIL (1 << VRING_PACKED_DESC_F_AVAIL)
+#define VRING_DESC_F_USED (1<< VRING_PACKED_DESC_F_USED)
+
+static inline bool virt_queue_packed__available(struct virt_queue *vq)
+{
+	uint16_t flags = vq->packed_vring.desc[vq->last_avail_idx].flags;
+	return !!(flags & VRING_DESC_F_AVAIL) == vq->packed_vring.avail_phase;
+}
+
 void virt_queue__used_idx_advance(struct virt_queue *queue, u16 jump);
 struct vring_used_elem * virt_queue__set_used_elem_no_update(struct virt_queue *queue, u32 head, u32 len, u16 offset);
 struct vring_used_elem *virt_queue__set_used_elem(struct virt_queue *queue, u32 head, u32 len);
+void virt_queue_packed__set_used_elem(struct virt_queue *queue, u32 head, u32 len, u32 sgs);
 
 bool virtio_queue__should_signal(struct virt_queue *vq);
 u16 virt_queue__get_iov(struct virt_queue *vq, struct iovec iov[],
@@ -208,6 +231,8 @@ u16 virt_queue__get_inout_iov(struct kvm *kvm, struct virt_queue *queue,
 			      struct iovec in_iov[], struct iovec out_iov[],
 			      u16 *in, u16 *out);
 int virtio__get_dev_specific_field(int offset, bool msix, u32 *config_off);
+
+u16 virt_queue_packed__get_head_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, u16 head, struct kvm *kvm);
 
 enum virtio_trans {
 	VIRTIO_PCI,
@@ -256,6 +281,8 @@ int virtio_compat_add_message(const char *device, const char *config);
 const char* virtio_trans_name(enum virtio_trans trans);
 void virtio_init_device_vq(struct kvm *kvm, struct virtio_device *vdev,
 			   struct virt_queue *vq, size_t nr_descs);
+void virtio_init_device_vq_packed(struct kvm *kvm, struct virtio_device *vdev,
+			   struct virt_queue *vq, size_t nr_descs);
 void virtio_exit_vq(struct kvm *kvm, struct virtio_device *vdev, void *dev,
 		    int num);
 bool virtio_access_config(struct kvm *kvm, struct virtio_device *vdev, void *dev,
@@ -277,5 +304,7 @@ void virtio_vhost_reset_vring(struct kvm *kvm, int vhost_fd, u32 index,
 int virtio_vhost_set_features(int vhost_fd, u64 features);
 
 int virtio_transport_parser(const struct option *opt, const char *arg, int unset);
+
+void dump_virtqueue_all_desc(struct virt_queue *queue);
 
 #endif /* KVM__VIRTIO_H */
