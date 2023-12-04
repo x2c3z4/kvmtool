@@ -161,23 +161,6 @@ static void virtio_blk_do_io_request(struct kvm *kvm, struct virt_queue *vq, str
 	}
 }
 
-static inline void virt_queue_packed__pop(struct virt_queue *queue, int sgs)
-{
-	u16 head = queue->last_avail_idx;
-	// Check if the desc is indirect
-	struct vring_packed_desc *desc = &queue->packed_vring.desc[head];
-
-	if (desc->flags & VRING_DESC_F_INDIRECT) {
-		sgs = 1;
-	}
-
-	queue->last_avail_idx = (queue->last_avail_idx + sgs) & (queue->packed_vring.num - 1);
-
-	/* Check the overflow of last_avail_idx */
-	if (queue->last_avail_idx < head)
-		queue->packed_vring.avail_phase = !queue->packed_vring.avail_phase;
-}
-
 static void virtio_blk_do_io(struct kvm *kvm, struct virt_queue *vq, struct blk_dev *bdev)
 {
 	struct blk_dev_req *req;

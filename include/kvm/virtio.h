@@ -183,12 +183,29 @@ static inline u16 virt_queue__pop(struct virt_queue *queue)
 	return virtio_guest_to_host_u16(queue->endian, guest_idx);
 }
 
+static inline void virt_queue_packed__pop(struct virt_queue *queue, int sgs)
+{
+	u16 head = queue->last_avail_idx;
+	// Check if the desc is indirect
+	struct vring_packed_desc *desc = &queue->packed_vring.desc[head];
+
+	if (desc->flags & VRING_DESC_F_INDIRECT) {
+		sgs = 1;
+	}
+
+	queue->last_avail_idx = (queue->last_avail_idx + sgs) & (queue->packed_vring.num - 1);
+
+	/* Check the overflow of last_avail_idx */
+	if (queue->last_avail_idx < head)
+		queue->packed_vring.avail_phase = !queue->packed_vring.avail_phase;
+}
+
 static inline struct vring_desc *virt_queue__get_desc(struct virt_queue *queue, u16 desc_ndx)
 {
 	return &queue->vring.desc[desc_ndx];
 }
 
-static inline bool virt_queue__available(struct virt_queue *vq)
+static inline bool virt_queue_split__available(struct virt_queue *vq)
 {
 	u16 last_avail_idx = virtio_host_to_guest_u16(vq->endian, vq->last_avail_idx);
 
@@ -215,6 +232,13 @@ static inline bool virt_queue_packed__available(struct virt_queue *vq)
 {
 	uint16_t flags = vq->packed_vring.desc[vq->last_avail_idx].flags;
 	return !!(flags & VRING_DESC_F_AVAIL) == vq->packed_vring.avail_phase;
+}
+
+static inline bool virt_queue__available(struct virt_queue *vq) {
+	if (vq->is_packed)
+		return virt_queue_packed__available(vq);
+	else
+		return virt_queue_split__available(vq);
 }
 
 void virt_queue__used_idx_advance(struct virt_queue *queue, u16 jump);
