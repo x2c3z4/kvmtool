@@ -68,12 +68,15 @@ struct vring_addr {
 };
 
 struct packed_vring {
-	u16     last_used_idx;
+	u16 last_used_idx;
+	u16 signalled_used_idx;
 	u16 num;
 	bool avail_phase;
 	bool used_phase;
 
 	struct vring_packed_desc* desc;
+	struct vring_packed_desc_event* driver_event;
+	struct vring_packed_desc_event* device_event;
 };
 
 struct virt_queue {

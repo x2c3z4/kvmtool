@@ -150,6 +150,7 @@ void virt_queue_packed__set_used_elem(struct virt_queue *queue, u32 head, u32 le
 	}
 	desc->id = head;
 
+	/* Must NOT make the descriptor used before buffer id is written to the descriptor. */
 	wmb();
 
 	if (packed_vring->used_phase) {
@@ -349,13 +350,12 @@ void virtio_init_device_vq(struct kvm *kvm, struct virtio_device *vdev,
 		vring_init(&vq->vring, nr_descs, p, addr->align);
 	} else {
 		u64 desc = (u64)addr->desc_hi << 32 | addr->desc_lo;
+		u64 avail = (u64)addr->avail_hi << 32 | addr->avail_lo;
+		u64 used = (u64)addr->used_hi << 32 | addr->used_lo;
 
 		vq->is_packed= !!(vdev->features & (1UL << VIRTIO_F_RING_PACKED));
 
 		if (!vq->is_packed) {
-			u64 avail = (u64)addr->avail_hi << 32 | addr->avail_lo;
-			u64 used = (u64)addr->used_hi << 32 | addr->used_lo;
-
 			vq->vring = (struct vring) {
 				.desc	= guest_flat_to_host(kvm, desc),
 				.used	= guest_flat_to_host(kvm, used),
@@ -369,6 +369,9 @@ void virtio_init_device_vq(struct kvm *kvm, struct virtio_device *vdev,
 				.avail_phase = true,
 				.used_phase = true,
 				.last_used_idx = 0,
+				.signalled_used_idx = 0,
+				.driver_event = guest_flat_to_host(kvm, avail),
+				.device_event = guest_flat_to_host(kvm, used),
 			};
 		}
 	}
@@ -402,10 +405,43 @@ bool virtio_queue__should_signal(struct virt_queue *vq)
 {
 	u16 old_idx, new_idx, event_idx;
 
-	// TODO
 	if (vq->is_packed) {
-		return true;
+		u16 off, off_wrap;
+
+		mb();
+		if (!vq->use_event_idx) {
+			if (vq->packed_vring.driver_event->flags != VRING_PACKED_EVENT_FLAG_DISABLE)
+				return true;
+			return false;
+		}
+
+		old_idx = vq->packed_vring.signalled_used_idx;
+		new_idx = vq->packed_vring.last_used_idx;
+		vq->packed_vring.signalled_used_idx = new_idx;
+
+		if (vq->packed_vring.driver_event->flags != VRING_PACKED_EVENT_FLAG_DESC) {
+			if (vq->packed_vring.driver_event->flags != VRING_PACKED_EVENT_FLAG_DISABLE)
+				return true;
+			return false;
+		}
+
+		mb();
+		off_wrap = vq->packed_vring.driver_event->off_wrap;
+		off = off_wrap & ~(1 << VRING_PACKED_EVENT_F_WRAP_CTR);
+
+		if (new_idx <= old_idx) {
+			old_idx -= vq->packed_vring.num;
+		}
+
+		if (vq->packed_vring.used_phase != (off_wrap >> VRING_PACKED_EVENT_F_WRAP_CTR))
+			off -= vq->packed_vring.num;
+
+		if (vring_need_event(off, new_idx, old_idx)) {
+			return true;
+		}
+		return false;
 	}
+
 	/*
 	 * Use mb to assure used idx has been increased before we signal the
 	 * guest, and we don't read a stale value for used_event. Without a mb
