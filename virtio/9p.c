@@ -1313,7 +1313,7 @@ static struct p9_pdu *virtio_p9_pdu_init(struct kvm *kvm, struct virt_queue *vq)
 	/* skip the pdu header p9_msg */
 	pdu->read_offset	= VIRTIO_9P_HDR_LEN;
 	pdu->write_offset	= VIRTIO_9P_HDR_LEN;
-	pdu->queue_head		= virt_queue__get_inout_iov(kvm, vq, pdu->in_iov,
+	pdu->queue_head		= virt_queue_split__get_inout_iov(kvm, vq, pdu->in_iov,
 					pdu->out_iov, &pdu->in_iov_cnt, &pdu->out_iov_cnt);
 	return pdu;
 }
@@ -1351,7 +1351,7 @@ static bool virtio_p9_do_io_request(struct kvm *kvm, struct p9_dev_job *job)
 		handler = virtio_9p_dotl_handler[cmd];
 
 	handler(p9dev, p9pdu, &len);
-	virt_queue__set_used_elem(vq, p9pdu->queue_head, len);
+	virt_queue_split__set_used_elem(vq, p9pdu->queue_head, len);
 	free(p9pdu);
 	return true;
 }

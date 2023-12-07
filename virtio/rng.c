@@ -64,7 +64,7 @@ static bool virtio_rng_do_io_request(struct kvm *kvm, struct rng_dev *rdev, stru
 	ssize_t len;
 	u16 out, in, head;
 
-	head	= virt_queue__get_iov(queue, iov, &out, &in, kvm);
+	head	= virt_queue_split__get_iov(queue, iov, &out, &in, kvm);
 	len	= readv(rdev->fd, iov, in);
 	if (len < 0 && (errno == EAGAIN || errno == EINTR)) {
 		/*
@@ -81,7 +81,7 @@ static bool virtio_rng_do_io_request(struct kvm *kvm, struct rng_dev *rdev, stru
 			return false;
 	}
 
-	virt_queue__set_used_elem(queue, head, len);
+	virt_queue_split__set_used_elem(queue, head, len);
 
 	return true;
 }

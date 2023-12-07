@@ -72,13 +72,10 @@ void virtio_blk_complete(void *param, long len)
 	*status	= (len < 0) ? VIRTIO_BLK_S_IOERR : VIRTIO_BLK_S_OK;
 
 	mutex_lock(&bdev->mutex);
-	if (req->vq->is_packed)
-		virt_queue_packed__set_used_elem(req->vq, req->head, len, req->in + req->out);
-	else
-		virt_queue__set_used_elem(req->vq, req->head, len);
+	virt_queue__set_used_elem(req->vq, req->head, len, req->in + req->out);
 	mutex_unlock(&bdev->mutex);
 
-	if (virtio_queue__should_signal(&bdev->vqs[queueid]))
+	if (virtio_queue_split__should_signal(&bdev->vqs[queueid]))
 		bdev->vdev.ops->signal_vq(req->kvm, &bdev->vdev, queueid);
 }
 
@@ -166,27 +163,21 @@ static void virtio_blk_do_io(struct kvm *kvm, struct virt_queue *vq, struct blk_
 	struct blk_dev_req *req;
 	u16 head;
 
-	if (vq->is_packed) {
-		while (virt_queue_packed__available(vq)) {
+	while (virt_queue__available(vq)) {
+		if (vq->is_packed) {
 			head		= vq->last_avail_idx;
 			req		= &bdev->reqs[head];
 			req->head	= virt_queue_packed__get_head_iov(vq, req->iov, &req->out,
 					&req->in, head, kvm);
-			req->vq		= vq;
 			virt_queue_packed__pop(vq, req->out + req->in);
-
-			virtio_blk_do_io_request(kvm, vq, req);
-		}
-	} else {
-		while (virt_queue__available(vq)) {
-			head		= virt_queue__pop(vq);
+		} else {
+			head		= virt_queue_split__pop(vq);
 			req		= &bdev->reqs[head];
-			req->head	= virt_queue__get_head_iov(vq, req->iov, &req->out,
+			req->head	= virt_queue_split__get_head_iov(vq, req->iov, &req->out,
 					&req->in, head, kvm);
-			req->vq		= vq;
-
-			virtio_blk_do_io_request(kvm, vq, req);
 		}
+		req->vq		= vq;
+		virtio_blk_do_io_request(kvm, vq, req);
 	}
 }
 

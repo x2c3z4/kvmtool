@@ -171,7 +171,7 @@ static inline u64 virtio_host_to_guest_u64(u16 endian, u64 value)
 
 #endif
 
-static inline u16 virt_queue__pop(struct virt_queue *queue)
+static inline u16 virt_queue_split__pop(struct virt_queue *queue)
 {
 	__u16 guest_idx;
 
@@ -184,23 +184,6 @@ static inline u16 virt_queue__pop(struct virt_queue *queue)
 
 	guest_idx = queue->vring.avail->ring[queue->last_avail_idx++ % queue->vring.num];
 	return virtio_guest_to_host_u16(queue->endian, guest_idx);
-}
-
-static inline void virt_queue_packed__pop(struct virt_queue *queue, int sgs)
-{
-	u16 head = queue->last_avail_idx;
-	// Check if the desc is indirect
-	struct vring_packed_desc *desc = &queue->packed_vring.desc[head];
-
-	if (desc->flags & VRING_DESC_F_INDIRECT) {
-		sgs = 1;
-	}
-
-	queue->last_avail_idx = (queue->last_avail_idx + sgs) & (queue->packed_vring.num - 1);
-
-	/* Check the overflow of last_avail_idx */
-	if (queue->last_avail_idx < head)
-		queue->packed_vring.avail_phase = !queue->packed_vring.avail_phase;
 }
 
 static inline struct vring_desc *virt_queue__get_desc(struct virt_queue *queue, u16 desc_ndx)
@@ -228,13 +211,79 @@ static inline bool virt_queue_split__available(struct virt_queue *vq)
 	return vq->vring.avail->idx != last_avail_idx;
 }
 
+void virt_queue_split__used_idx_advance(struct virt_queue *queue, u16 jump);
+struct vring_used_elem * virt_queue_split__set_used_elem_no_update(struct virt_queue *queue, u32 head, u32 len, u16 offset);
+struct vring_used_elem *virt_queue_split__set_used_elem(struct virt_queue *queue, u32 head, u32 len);
+
+bool virtio_queue_split__should_signal(struct virt_queue *vq);
+u16 virt_queue_split__get_iov(struct virt_queue *vq, struct iovec iov[],
+			u16 *out, u16 *in, struct kvm *kvm);
+u16 virt_queue_split__get_head_iov(struct virt_queue *vq, struct iovec iov[],
+			     u16 *out, u16 *in, u16 head, struct kvm *kvm);
+u16 virt_queue_split__get_inout_iov(struct kvm *kvm, struct virt_queue *queue,
+			      struct iovec in_iov[], struct iovec out_iov[],
+			      u16 *in, u16 *out);
+int virtio__get_dev_specific_field(int offset, bool msix, u32 *config_off);
+
+// packed
 #define VRING_DESC_F_AVAIL (1 << VRING_PACKED_DESC_F_AVAIL)
 #define VRING_DESC_F_USED (1<< VRING_PACKED_DESC_F_USED)
+
+u16 virt_queue_packed__get_head_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, u16 head, struct kvm *kvm);
+bool virtio_queue_packed__should_signal(struct virt_queue *vq);
+void virt_queue_packed__set_used_elem(struct virt_queue *queue, u32 head, u32 len, u32 sgs);
 
 static inline bool virt_queue_packed__available(struct virt_queue *vq)
 {
 	uint16_t flags = vq->packed_vring.desc[vq->last_avail_idx].flags;
 	return !!(flags & VRING_DESC_F_AVAIL) == vq->packed_vring.avail_phase;
+}
+
+static inline void virt_queue_packed__pop(struct virt_queue *queue, int sgs)
+{
+	u16 head = queue->last_avail_idx;
+	// Check if the desc is indirect
+	struct vring_packed_desc *desc = &queue->packed_vring.desc[head];
+
+	if (desc->flags & VRING_DESC_F_INDIRECT) {
+		sgs = 1;
+	}
+
+	queue->last_avail_idx = (queue->last_avail_idx + sgs) & (queue->packed_vring.num - 1);
+
+	/* Check the overflow of last_avail_idx */
+	if (queue->last_avail_idx < head)
+		queue->packed_vring.avail_phase = !queue->packed_vring.avail_phase;
+}
+
+// common
+static inline bool virtio_queue__should_signal(struct virt_queue *vq)
+{
+	if(vq->is_packed) {
+		return virtio_queue_packed__should_signal(vq);
+	} else {
+		return virtio_queue_split__should_signal(vq);
+	}
+}
+
+static inline u16 virt_queue__get_iov(struct virt_queue *vq, struct iovec iov[],
+			u16 *out, u16 *in, struct kvm *kvm)
+{
+	u16 head;
+	if (!vq->is_packed) {
+		head = virt_queue_split__get_iov(vq, iov, out, in, kvm);
+	} else {
+		head = virt_queue_packed__get_head_iov(vq, iov, out, in, vq->last_avail_idx, kvm);
+		virt_queue_packed__pop(vq, *in + *out);
+	}
+	return head;
+}
+
+static inline void virt_queue__set_used_elem(struct virt_queue *queue, u32 head, u32 len, u32 sgs) {
+	if (queue->is_packed)
+		virt_queue_packed__set_used_elem(queue, head, len, sgs);
+	else
+		virt_queue_split__set_used_elem(queue, head, len);
 }
 
 static inline bool virt_queue__available(struct virt_queue *vq) {
@@ -243,23 +292,6 @@ static inline bool virt_queue__available(struct virt_queue *vq) {
 	else
 		return virt_queue_split__available(vq);
 }
-
-void virt_queue__used_idx_advance(struct virt_queue *queue, u16 jump);
-struct vring_used_elem * virt_queue__set_used_elem_no_update(struct virt_queue *queue, u32 head, u32 len, u16 offset);
-struct vring_used_elem *virt_queue__set_used_elem(struct virt_queue *queue, u32 head, u32 len);
-void virt_queue_packed__set_used_elem(struct virt_queue *queue, u32 head, u32 len, u32 sgs);
-
-bool virtio_queue__should_signal(struct virt_queue *vq);
-u16 virt_queue__get_iov(struct virt_queue *vq, struct iovec iov[],
-			u16 *out, u16 *in, struct kvm *kvm);
-u16 virt_queue__get_head_iov(struct virt_queue *vq, struct iovec iov[],
-			     u16 *out, u16 *in, u16 head, struct kvm *kvm);
-u16 virt_queue__get_inout_iov(struct kvm *kvm, struct virt_queue *queue,
-			      struct iovec in_iov[], struct iovec out_iov[],
-			      u16 *in, u16 *out);
-int virtio__get_dev_specific_field(int offset, bool msix, u32 *config_off);
-
-u16 virt_queue_packed__get_head_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, u16 head, struct kvm *kvm);
 
 enum virtio_trans {
 	VIRTIO_PCI,
@@ -307,8 +339,6 @@ void virtio_exit(struct kvm *kvm, struct virtio_device *vdev);
 int virtio_compat_add_message(const char *device, const char *config);
 const char* virtio_trans_name(enum virtio_trans trans);
 void virtio_init_device_vq(struct kvm *kvm, struct virtio_device *vdev,
-			   struct virt_queue *vq, size_t nr_descs);
-void virtio_init_device_vq_packed(struct kvm *kvm, struct virtio_device *vdev,
 			   struct virt_queue *vq, size_t nr_descs);
 void virtio_exit_vq(struct kvm *kvm, struct virtio_device *vdev, void *dev,
 		    int num);

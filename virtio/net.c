@@ -126,47 +126,23 @@ static void *virtio_net_rx_thread(void *p)
 			}
 
 			copied = num_buffers = 0;
-			if (!vq->is_packed) {
-				head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
-				hdr = iov[0].iov_base;
-				while (copied < len) {
-					size_t iovsize = min_t(size_t, len - copied, iov_size(iov, in));
+			head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
+			hdr = iov[0].iov_base;
+			while (copied < len) {
+				size_t iovsize = min_t(size_t, len - copied, iov_size(iov, in));
 
-					memcpy_toiovec(iov, buffer + copied, iovsize);
-					copied += iovsize;
-					virt_queue__set_used_elem_no_update(vq, head, iovsize, num_buffers++);
-					if (copied == len)
-						break;
-					while (!virt_queue__available(vq))
-						sleep(0);
-					head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
-				}
-			} else {
-				//printf("virtio-net-rx: vq %u available packed: %d\n", queue->id, vq->is_packed);
-				//dump_virtqueue_all_desc(vq);
-				head = virt_queue_packed__get_head_iov(vq, iov, &out, &in, vq->last_avail_idx, kvm);
-				virt_queue_packed__pop(vq, in + out);
-				hdr = iov[0].iov_base;
-				while (copied < len) {
-					size_t iovsize = min_t(size_t, len - copied, iov_size(iov, in));
+				memcpy_toiovec(iov, buffer + copied, iovsize);
+				copied += iovsize;
+				virt_queue__set_used_elem(vq, head, iovsize, in + out);
+				num_buffers++;
 
-					memcpy_toiovec(iov, buffer + copied, iovsize);
-					copied += iovsize;
-
-					virt_queue_packed__set_used_elem(vq, head, iovsize, in + out);
-					num_buffers++;
-
-					if (copied == len)
-						break;
-					while (!virt_queue__available(vq))
-						sleep(0);
-					head = virt_queue_packed__get_head_iov(vq, iov, &out, &in, vq->last_avail_idx, kvm);
-					virt_queue_packed__pop(vq, in + out);
-				}
-				//printf("virtio-net-rx: vq %u available packed: %d done\n", queue->id, vq->is_packed);
-				//dump_virtqueue_all_desc(vq);
+				if (copied == len)
+					break;
+				while (!virt_queue__available(vq))
+					sleep(0);
+				head = virt_queue_split__get_iov(vq, iov, &out, &in, kvm);
 			}
-
+			
 			/*
 			 * The device MUST set num_buffers, except in the case
 			 * where the legacy driver did not negotiate
@@ -177,7 +153,7 @@ static void *virtio_net_rx_thread(void *p)
 				hdr->num_buffers = virtio_host_to_guest_u16(vq->endian, num_buffers);
 
 			if (!vq->is_packed)
-				virt_queue__used_idx_advance(vq, num_buffers);
+				virt_queue_split__used_idx_advance(vq, num_buffers);
 
 			/* We should interrupt guest right now, otherwise latency is huge. */
 			if (virtio_queue__should_signal(vq))
@@ -215,12 +191,7 @@ static void *virtio_net_tx_thread(void *p)
 		while (virt_queue__available(vq)) {
 			//printf("virtio-net-tx: vq %u available packed: %d\n", queue->id, vq->is_packed);
 			//dump_virtqueue_all_desc(vq);
-			if (!vq->is_packed) {
-				head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
-			} else {
-				head = virt_queue_packed__get_head_iov(vq, iov, &out, &in, vq->last_avail_idx, kvm);
-				virt_queue_packed__pop(vq, in + out);
-			}
+			head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
 			len = ndev->ops->tx(iov, out, ndev);
 			if (len < 0) {
 				pr_warning("%s: tx on vq %u failed (%d)\n",
@@ -228,11 +199,7 @@ static void *virtio_net_tx_thread(void *p)
 				goto out_err;
 			}
 
-			if (!vq->is_packed) {
-				virt_queue__set_used_elem(vq, head, len);
-			} else {
-				virt_queue_packed__set_used_elem(vq, head, len, in + out);
-			}
+			virt_queue__set_used_elem(vq, head, len, in + out);
 			//printf("virtio-net-tx: vq %u available packed: %d done\n", queue->id, vq->is_packed);
 			//dump_virtqueue_all_desc(vq);
 		}
@@ -273,12 +240,7 @@ static void *virtio_net_ctrl_thread(void *p)
 		mutex_unlock(&queue->lock);
 
 		while (virt_queue__available(vq)) {
-			if (!vq->is_packed) {
-				head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
-			} else {
-				head = virt_queue_packed__get_head_iov(vq, iov, &out, &in, vq->last_avail_idx, kvm);
-				virt_queue_packed__pop(vq, in + out);
-			}
+			head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
 
 			len = min(iov_size(iov, in), sizeof(ctrl));
 			memcpy_fromiovec((void *)&ctrl, iov, len);
@@ -292,11 +254,7 @@ static void *virtio_net_ctrl_thread(void *p)
 				break;
 			}
 			memcpy_toiovec(iov + in, &ack, sizeof(ack));
-			if (!vq->is_packed) {
-				virt_queue__set_used_elem(vq, head, sizeof(ack));
-			} else {
-				virt_queue_packed__set_used_elem(vq, head, sizeof(ack), in + out);
-			}
+			virt_queue__set_used_elem(vq, head, sizeof(ack), in + out);
 		}
 
 		if (virtio_queue__should_signal(vq))

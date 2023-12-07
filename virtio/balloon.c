@@ -57,7 +57,7 @@ static bool virtio_bln_do_io_request(struct kvm *kvm, struct bln_dev *bdev, stru
 	u32 *ptrs, i;
 	u32 actual;
 
-	head	= virt_queue__get_iov(queue, iov, &out, &in, kvm);
+	head	= virt_queue_split__get_iov(queue, iov, &out, &in, kvm);
 	ptrs	= iov[0].iov_base;
 	len	= iov[0].iov_len / sizeof(u32);
 
@@ -75,7 +75,7 @@ static bool virtio_bln_do_io_request(struct kvm *kvm, struct bln_dev *bdev, stru
 	}
 	bdev->config.actual = cpu_to_le32(actual);
 
-	virt_queue__set_used_elem(queue, head, len);
+	virt_queue_split__set_used_elem(queue, head, len);
 
 	return true;
 }
@@ -87,7 +87,7 @@ static bool virtio_bln_do_stat_request(struct kvm *kvm, struct bln_dev *bdev, st
 	struct virtio_balloon_stat *stat;
 	u64 wait_val = 1;
 
-	head = virt_queue__get_iov(queue, iov, &out, &in, kvm);
+	head = virt_queue_split__get_iov(queue, iov, &out, &in, kvm);
 	stat = iov[0].iov_base;
 
 	/* Initial empty stat buffer */
@@ -135,7 +135,7 @@ static int virtio_bln__collect_stats(struct kvm *kvm)
 	if (!vq->enabled)
 		return -ENODEV;
 
-	virt_queue__set_used_elem(vq, bdev.cur_stat_head,
+	virt_queue_split__set_used_elem(vq, bdev.cur_stat_head,
 				  sizeof(struct virtio_balloon_stat));
 	bdev.vdev.ops->signal_vq(kvm, &bdev.vdev, VIRTIO_BLN_STATS);
 

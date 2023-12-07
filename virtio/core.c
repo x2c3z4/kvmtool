@@ -51,7 +51,7 @@ int virtio_transport_parser(const struct option *opt, const char *arg, int unset
 	return 0;
 }
 
-void virt_queue__used_idx_advance(struct virt_queue *queue, u16 jump)
+void virt_queue_split__used_idx_advance(struct virt_queue *queue, u16 jump)
 {
 	u16 idx = virtio_guest_to_host_u16(queue->endian,
 					   queue->vring.used->idx);
@@ -67,7 +67,7 @@ void virt_queue__used_idx_advance(struct virt_queue *queue, u16 jump)
 }
 
 struct vring_used_elem *
-virt_queue__set_used_elem_no_update(struct virt_queue *queue, u32 head,
+virt_queue_split__set_used_elem_no_update(struct virt_queue *queue, u32 head,
 				    u32 len, u16 offset)
 {
 	struct vring_used_elem *used_elem;
@@ -81,12 +81,12 @@ virt_queue__set_used_elem_no_update(struct virt_queue *queue, u32 head,
 	return used_elem;
 }
 
-struct vring_used_elem *virt_queue__set_used_elem(struct virt_queue *queue, u32 head, u32 len)
+struct vring_used_elem *virt_queue_split__set_used_elem(struct virt_queue *queue, u32 head, u32 len)
 {
 	struct vring_used_elem *used_elem;
 
-	used_elem = virt_queue__set_used_elem_no_update(queue, head, len, 0);
-	virt_queue__used_idx_advance(queue, 1);
+	used_elem = virt_queue_split__set_used_elem_no_update(queue, head, len, 0);
+	virt_queue_split__used_idx_advance(queue, 1);
 
 	return used_elem;
 }
@@ -208,7 +208,7 @@ static unsigned next_packed_desc(struct virt_queue *vq, struct vring_packed_desc
 	return min(next, max);
 }
 
-u16 virt_queue__get_head_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, u16 head, struct kvm *kvm)
+u16 virt_queue_split__get_head_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, u16 head, struct kvm *kvm)
 {
 	struct vring_desc *desc;
 	u16 idx;
@@ -292,24 +292,24 @@ u16 virt_queue_packed__get_head_iov(struct virt_queue *vq, struct iovec iov[], u
 	return buffer_id;
 }
 
-u16 virt_queue__get_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, struct kvm *kvm)
+u16 virt_queue_split__get_iov(struct virt_queue *vq, struct iovec iov[], u16 *out, u16 *in, struct kvm *kvm)
 {
 	u16 head;
 
-	head = virt_queue__pop(vq);
+	head = virt_queue_split__pop(vq);
 
-	return virt_queue__get_head_iov(vq, iov, out, in, head, kvm);
+	return virt_queue_split__get_head_iov(vq, iov, out, in, head, kvm);
 }
 
 /* in and out are relative to guest */
-u16 virt_queue__get_inout_iov(struct kvm *kvm, struct virt_queue *queue,
+u16 virt_queue_split__get_inout_iov(struct kvm *kvm, struct virt_queue *queue,
 			      struct iovec in_iov[], struct iovec out_iov[],
 			      u16 *in, u16 *out)
 {
 	struct vring_desc *desc;
 	u16 head, idx;
 
-	idx = head = virt_queue__pop(queue);
+	idx = head = virt_queue_split__pop(queue);
 	*out = *in = 0;
 	do {
 		u64 addr;
@@ -401,7 +401,7 @@ int virtio__get_dev_specific_field(int offset, bool msix, u32 *config_off)
 	return VIRTIO_PCI_O_CONFIG;
 }
 
-bool virtio_queue__should_signal(struct virt_queue *vq)
+bool virtio_queue_split__should_signal(struct virt_queue *vq)
 {
 	u16 old_idx, new_idx, event_idx;
 
@@ -468,6 +468,45 @@ bool virtio_queue__should_signal(struct virt_queue *vq)
 		return true;
 	}
 
+	return false;
+}
+
+bool virtio_queue_packed__should_signal(struct virt_queue *vq)
+{
+	u16 old_idx, new_idx;
+	u16 off, off_wrap;
+
+	mb();
+	if (!vq->use_event_idx) {
+		if (vq->packed_vring.driver_event->flags != VRING_PACKED_EVENT_FLAG_DISABLE)
+			return true;
+		return false;
+	}
+
+	old_idx = vq->packed_vring.signalled_used_idx;
+	new_idx = vq->packed_vring.last_used_idx;
+	vq->packed_vring.signalled_used_idx = new_idx;
+
+	if (vq->packed_vring.driver_event->flags != VRING_PACKED_EVENT_FLAG_DESC) {
+		if (vq->packed_vring.driver_event->flags != VRING_PACKED_EVENT_FLAG_DISABLE)
+			return true;
+		return false;
+	}
+
+	mb();
+	off_wrap = vq->packed_vring.driver_event->off_wrap;
+	off = off_wrap & ~(1 << VRING_PACKED_EVENT_F_WRAP_CTR);
+
+	if (new_idx <= old_idx) {
+		old_idx -= vq->packed_vring.num;
+	}
+
+	if (vq->packed_vring.used_phase != (off_wrap >> VRING_PACKED_EVENT_F_WRAP_CTR))
+		off -= vq->packed_vring.num;
+
+	if (vring_need_event(off, new_idx, old_idx)) {
+		return true;
+	}
 	return false;
 }
 
